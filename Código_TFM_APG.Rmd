@@ -1,0 +1,845 @@
+---
+title: "codigo TFM"
+author: "Aaron Pérez Gigante"
+date: "2026-05-03"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Codigo TFM
+
+Como paso previos, cargamos las librerias necesarias:
+```{r}
+paquetes <- c("survival", "survminer", "tidyverse", "ggplot2", "dplyr", "stringr", "readr", "tibble", "knitr", "tableone")
+invisible(lapply(paquetes, library, character.only = TRUE))
+if (requireNamespace("ranger", quietly = TRUE)) library(ranger)
+```
+# Carga y procesado de datos
+## Cargar datos
+En primer lugar cargamos los datos en R
+```{r}
+bd_TFM <- read_tsv("C:/Users/Aaron/Documents/UOC/TFM/BD_APG.txt", na = c("", "NA"), show_col_types = FALSE)
+bd_prep <- bd_TFM
+names(bd_prep); str(bd_prep); summary(bd_prep)
+```
+## Factorizar y transformar datos
+Se procede a factorizar y transformar las variables para facilitar su manipulacion:
+```{r}
+# Preprocesado mínimo: renombrar/factorizar variables para la descriptiva inicial.
+bd_prep <- bd_prep %>%
+  mutate(
+    Sexo = factor(Sex, levels = c("Male", "Female"), labels = c("Hombre", "Mujer")),
+    Edad_original = `Age recode with single ages and 90+`,
+    Edad_grupo_original = `Age recode with <1 year olds and 90+`,
+    Any_diag = `Year of diagnosis`,
+    Raza = factor(`Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)`),
+    Local_an = `Primary Site - labeled`,
+    Estadio_original = `Combined Summary Stage with Expanded Regional Codes (2004+)`,
+    Estadio_SEER = factor(Estadio_original),
+    Grado_2017_original = factor(`Grade Recode (thru 2017)`),
+    Grado_2018_original = factor(`Derived Summary Grade 2018 (2018+)`),
+    Histologia = factor(`Histology recode - broad groupings`),
+    Meses_surv_original = as.numeric(`Survival months`),
+    Estado_vital = factor(`Vital status recode (study cutoff used)`),
+    Causa_muerte_SEER = factor(`SEER cause-specific death classification`)
+  )
+```
+```{r}
+vars_bloque_a <- c("Sexo", "Edad_original", "Edad_grupo_original", "Any_diag", "Raza", "Local_an", "Estadio_SEER", "Grado_2017_original", "Grado_2018_original", "Histologia", "Meses_surv_original", "Estado_vital", "Causa_muerte_SEER")
+
+resumen_variable <- function(base, variable) {
+  x <- base[[variable]]
+  if (is.numeric(x)) {
+    tabla <- tibble(
+      Variable = c(variable, rep("", 7)),
+      Indicador = c("Tipo", "N", "NAs", "NAs %", "Media", "SD", "Mediana", "Rango"),
+      Valor = c(class(x)[1], sum(!is.na(x)), sum(is.na(x)), round(mean(is.na(x)) * 100, 2), round(mean(x, na.rm = TRUE), 2), round(sd(x, na.rm = TRUE), 2), round(median(x, na.rm = TRUE), 2), paste0(min(x, na.rm = TRUE), " - ", max(x, na.rm = TRUE)))
+    )
+  } else {
+    tab <- as.data.frame(table(x, useNA = "ifany")) %>% as_tibble() %>% rename(Categoria = x, N = Freq) %>% mutate(Porcentaje = round(100 * N / sum(N), 2), Categoria = as.character(Categoria))
+    tabla <- tibble(Variable = c(variable, rep("", nrow(tab))), Indicador = c("Tipo", tab$Categoria), Valor = c(class(x)[1], paste0(tab$N, " (", tab$Porcentaje, "%)")))
+  }
+  bind_rows(tabla, tibble(Variable = "", Indicador = "", Valor = ""))
+}
+
+tabla_bloque_a <- bind_rows(lapply(vars_bloque_a, function(v) resumen_variable(bd_prep, v)))
+kable(tabla_bloque_a, caption = "Descriptivo tras renombrar y factorizar variables", booktabs = TRUE, align = c("l", "l", "l"))
+```
+
+## Recodifcación de variables
+```{r}
+# Recodificaciones para descriptiva final y modelos.
+niveles_local <- c("Colon derecho", "Colon izquierdo", "Union rectosigmoidea", "Recto", "Apendice", "Otros/No especificado")
+niveles_estadio <- c("Localizado", "Regional", "Distante", "Desconocido", "In situ")
+niveles_grado <- c("G1 - Bien diferenciado", "G2 - Moderadamente diferenciado", "G3 - Pobremente diferenciado", "G4 - Indiferenciado/anaplasico", "Desconocido", "No exacto alto/bajo NOS")
+
+bd_prep <- bd_prep %>%
+  mutate(
+    Edad = case_when(str_detect(Edad_original, "^90\\+") ~ 90L, TRUE ~ as.integer(str_extract(Edad_original, "\\d+"))),
+    Codigo_local = str_extract(Local_an, "^C[0-9]{2}\\.[0-9]"),
+    Local_cat = factor(case_when(
+      Codigo_local %in% c("C18.0", "C18.2", "C18.3", "C18.4") ~ "Colon derecho",
+      Codigo_local %in% c("C18.5", "C18.6", "C18.7") ~ "Colon izquierdo",
+      Codigo_local == "C19.9" ~ "Union rectosigmoidea",
+      Codigo_local == "C20.9" ~ "Recto",
+      Codigo_local == "C18.1" ~ "Apendice",
+      TRUE ~ "Otros/No especificado"), levels = niveles_local),
+    Estadio = factor(case_when(
+      Estadio_original == "Localized only" ~ "Localizado",
+      Estadio_original %in% c("Regional by direct extension only", "Regional lymph nodes involved only", "Regional by both direct extension and lymph node involvement") ~ "Regional",
+      Estadio_original == "Distant site(s)/node(s) involved" ~ "Distante",
+      Estadio_original == "Unknown/unstaged/unspecified/DCO" ~ "Desconocido",
+      Estadio_original == "In situ" ~ "In situ",
+      TRUE ~ NA_character_), levels = niveles_estadio),
+    Grado_2017 = case_when(
+      Grado_2017_original == "Well differentiated; Grade I" ~ "G1 - Bien diferenciado",
+      Grado_2017_original == "Moderately differentiated; Grade II" ~ "G2 - Moderadamente diferenciado",
+      Grado_2017_original == "Poorly differentiated; Grade III" ~ "G3 - Pobremente diferenciado",
+      Grado_2017_original == "Undifferentiated; anaplastic; Grade IV" ~ "G4 - Indiferenciado/anaplasico",
+      Grado_2017_original == "Unknown" ~ "Desconocido",
+      TRUE ~ NA_character_),
+    Grado_2018 = case_when(
+      Grado_2018_original %in% c("1", "A") ~ "G1 - Bien diferenciado",
+      Grado_2018_original %in% c("2", "B") ~ "G2 - Moderadamente diferenciado",
+      Grado_2018_original %in% c("3", "C") ~ "G3 - Pobremente diferenciado",
+      Grado_2018_original %in% c("4", "D") ~ "G4 - Indiferenciado/anaplasico",
+      Grado_2018_original == "9" ~ "Desconocido",
+      Grado_2018_original %in% c("H", "L") ~ "No exacto alto/bajo NOS",
+      TRUE ~ NA_character_),
+    Grado = factor(case_when(Any_diag <= 2017 ~ Grado_2017, Any_diag >= 2018 ~ Grado_2018, TRUE ~ NA_character_), levels = niveles_grado),
+    Meses_surv = if_else(Meses_surv_original == 0, 0.5, Meses_surv_original),
+    Evento_muerte = if_else(Estado_vital == "Dead", 1L, 0L),
+    Evento_css = case_when(Causa_muerte_SEER == "Dead (attributable to this cancer dx)" ~ 1L, Causa_muerte_SEER == "Alive or dead of other cause" ~ 0L, Causa_muerte_SEER == "Dead (missing/unknown COD)" ~ NA_integer_, TRUE ~ NA_integer_),
+    Evento_otras = case_when(Estado_vital == "Dead" & Causa_muerte_SEER == "Alive or dead of other cause" ~ 1L, Causa_muerte_SEER == "Dead (missing/unknown COD)" ~ NA_integer_, TRUE ~ 0L)
+  )
+```
+
+Descriptivo tras la recodificación para comprobar:
+
+```{r}
+vars_bloque_b <- c("Sexo", "Edad", "Any_diag", "Raza", "Local_cat", "Estadio", "Grado", "Histologia", "Meses_surv", "Evento_muerte", "Evento_css", "Evento_otras")
+tabla_bloque_b <- bind_rows(lapply(vars_bloque_b, function(v) resumen_variable(bd_prep, v)))
+kable(tabla_bloque_b, caption = "Descriptivo tras recodificación analítica de variables", booktabs = TRUE, align = c("l", "l", "l"))
+```
+## Filtrado y generación de cohortes
+Fase de filtrado y creación de cohortes para los distintos analisis:
+
+```{r}
+grados_validos <- c("G1 - Bien diferenciado", "G2 - Moderadamente diferenciado", "G3 - Pobremente diferenciado", "G4 - Indiferenciado/anaplasico")
+
+bd_limpia <- bd_prep %>% filter(!is.na(Meses_surv), !is.na(Edad), Edad >= 18, Estadio != "In situ", !Codigo_local %in% c("C18.1", "C26.0"))
+bd_principal <- bd_limpia %>% filter(Estadio %in% c("Localizado", "Regional", "Distante"))
+bd_css <- bd_principal %>% filter(!is.na(Evento_css))
+bd_grado <- bd_principal %>% filter(Grado %in% grados_validos)
+bd_css_grado <- bd_css %>% filter(Grado %in% grados_validos)
+```
+# Diagrama de preprocesado
+```{r}
+# Tabla de flujo de preprocesado y limpieza.
+base_surv <- bd_prep %>% filter(!is.na(Meses_surv))
+base_adultos <- base_surv %>% filter(!is.na(Edad), Edad >= 18)
+base_invasivo <- base_adultos %>% filter(Estadio != "In situ")
+base_sin_apendice <- base_invasivo %>% filter(Codigo_local != "C18.1")
+
+tabla_flujo <- tibble(
+  Paso = c("Base exportada SEER", "Supervivencia disponible", "Adultos edad >= 18", "Excluir estadio in situ", "Excluir apendice C18.1", "Excluir C26.0", "Base limpia descriptiva", "Cohorte principal con estadio conocido", "Cohorte CSS con causa de muerte conocida", "Cohorte con grado I-IV conocido", "Cohorte CSS + grado I-IV conocido"),
+  N = c(nrow(bd_prep), nrow(base_surv), nrow(base_adultos), nrow(base_invasivo), nrow(base_sin_apendice), nrow(bd_limpia), nrow(bd_limpia), nrow(bd_principal), nrow(bd_css), nrow(bd_grado), nrow(bd_css_grado))
+) %>% mutate(Excluidos_paso = c(NA, N[-length(N)] - N[-1]), Porcentaje_base = round(100 * N / first(N), 2))
+
+kable(tabla_flujo, caption = "Flujo de preprocesado, limpieza y definición de cohortes", booktabs = TRUE, align = c("l", "r", "r", "r"))
+```
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='95%', fig.cap='Flujo de preprocesado, limpieza y definición de cohortes'}
+knitr::include_graphics("figura_flujo_preprocesado_limpieza.png")
+```
+
+# Análisis descriptivo comparativo por sexo
+
+Se genera el análisis descriptivo a partir de la cohorte principal. Se presentan tablas sin contrastes de hipótesis, dado el gran tamaño muestral, y se complementan con gráficos descriptivos seleccionados.
+
+```{r descriptivo-sexo-preparacion, message=FALSE, warning=FALSE}
+ruta_salida <- getwd()
+
+bd_desc_sexo <- bd_principal %>%
+  mutate(
+    Evento_muerte_desc = factor(case_when(Evento_muerte == 0 ~ "Vivo/censurado", Evento_muerte == 1 ~ "Fallecido", TRUE ~ "No disponible"), levels = c("Vivo/censurado", "Fallecido", "No disponible")),
+    Evento_css_desc = factor(case_when(Evento_css == 0 ~ "No evento CSS", Evento_css == 1 ~ "Muerte atribuible al cáncer", is.na(Evento_css) ~ "Causa de muerte desconocida", TRUE ~ "No disponible"), levels = c("No evento CSS", "Muerte atribuible al cáncer", "Causa de muerte desconocida", "No disponible"))
+  )
+
+fmt_n <- function(x) format(x, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+fmt_num <- function(x, digits = 2) format(round(x, digits), big.mark = ".", decimal.mark = ",", nsmall = digits)
+fmt_pct <- function(x, digits = 1) paste0(format(round(x, digits), decimal.mark = ",", nsmall = digits), "%")
+fmt_n_pct <- function(n, denom) paste0(fmt_n(n), " (", fmt_pct(100 * n / denom, 1), ")")
+```
+
+## Descripción global de la cohorte principal
+
+```{r descriptivo-global-principal, message=FALSE, warning=FALSE}
+resumen_global_numerica <- function(base, variable, etiqueta) {
+  x <- base[[variable]]
+
+  tibble(
+    Variable = c(etiqueta, "", "", "", "", ""),
+    Categoria = c("N", "NAs", "Media", "DE", "Mediana", "Rango"),
+    Total = c(
+      fmt_n(sum(!is.na(x))),
+      fmt_n(sum(is.na(x))),
+      fmt_num(mean(x, na.rm = TRUE), 2),
+      fmt_num(sd(x, na.rm = TRUE), 2),
+      fmt_num(median(x, na.rm = TRUE), 2),
+      paste0(fmt_num(min(x, na.rm = TRUE), 1), " - ", fmt_num(max(x, na.rm = TRUE), 1))
+    )
+  )
+}
+
+resumen_global_categorica <- function(base, variable, etiqueta) {
+  x <- base[[variable]]
+  niveles <- if (is.factor(x)) levels(x) else sort(unique(as.character(na.omit(x))))
+
+  datos <- tibble(Categoria = as.character(x)) %>%
+    mutate(
+      Categoria = if_else(is.na(Categoria), "No disponible", Categoria),
+      Categoria = factor(Categoria, levels = unique(c(niveles, "No disponible")))
+    )
+
+  datos %>%
+    count(Categoria, .drop = FALSE) %>%
+    filter(n > 0) %>%
+    mutate(
+      Total = fmt_n_pct(n, nrow(datos)),
+      Variable = if_else(row_number() == 1, etiqueta, "")
+    ) %>%
+    select(Variable, Categoria, Total)
+}
+
+tabla_global <- bind_rows(
+  resumen_global_categorica(bd_desc_sexo, "Sexo", "Sexo"),
+  resumen_global_numerica(bd_desc_sexo, "Edad", "Edad al diagnóstico"),
+  resumen_global_numerica(bd_desc_sexo, "Any_diag", "Año de diagnóstico"),
+  resumen_global_categorica(bd_desc_sexo, "Raza", "Raza/origen"),
+  resumen_global_categorica(bd_desc_sexo, "Local_cat", "Localización anatómica"),
+  resumen_global_categorica(bd_desc_sexo, "Estadio", "Estadio"),
+  resumen_global_categorica(bd_desc_sexo, "Grado", "Grado histológico"),
+  resumen_global_numerica(bd_desc_sexo, "Meses_surv", "Seguimiento en meses"),
+  resumen_global_categorica(bd_desc_sexo, "Evento_muerte_desc", "Estado vital")
+)
+
+kable(
+  tabla_global,
+  caption = "Descripción global de la cohorte principal",
+  booktabs = TRUE,
+  longtable = TRUE,
+  align = c("l", "l", "r")
+)
+```
+
+## Variables numéricas según sexo
+
+```{r descriptivo-numericas-sexo, message=FALSE, warning=FALSE}
+resumen_num_sexo <- function(base, variable, etiqueta) {
+  base %>%
+    group_by(Sexo) %>%
+    summarise(
+      N = sum(!is.na(.data[[variable]])),
+      NAs = sum(is.na(.data[[variable]])),
+      Media = mean(.data[[variable]], na.rm = TRUE),
+      DE = sd(.data[[variable]], na.rm = TRUE),
+      Mediana = median(.data[[variable]], na.rm = TRUE),
+      Min = min(.data[[variable]], na.rm = TRUE),
+      Max = max(.data[[variable]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Variable = etiqueta,
+      N = fmt_n(N),
+      NAs = fmt_n(NAs),
+      Media = fmt_num(Media, 2),
+      DE = fmt_num(DE, 2),
+      Mediana = fmt_num(Mediana, 2),
+      Minimo = fmt_num(Min, 1),
+      Maximo = fmt_num(Max, 1)
+    ) %>%
+    select(Variable, Sexo, N, NAs, Media, DE, Mediana, Minimo, Maximo)
+}
+
+tabla_num_sexo <- bind_rows(
+  resumen_num_sexo(bd_desc_sexo, "Edad", "Edad al diagnóstico"),
+  resumen_num_sexo(bd_desc_sexo, "Any_diag", "Año de diagnóstico"),
+  resumen_num_sexo(bd_desc_sexo, "Meses_surv", "Seguimiento en meses")
+) %>%
+  mutate(Variable = if_else(duplicated(Variable), "", Variable))
+
+kable(
+  tabla_num_sexo,
+  caption = "Variables numéricas de la cohorte principal estratificadas por sexo",
+  booktabs = TRUE,
+  longtable = TRUE,
+  align = c("l", "l", "r", "r", "r", "r", "r", "r", "r")
+)
+```
+
+## Variables categóricas según sexo
+
+```{r descriptivo-categoricas-sexo, message=FALSE, warning=FALSE}
+resumen_cat_sexo <- function(base, variable, etiqueta) {
+  x <- base[[variable]]
+  niveles <- if (is.factor(x)) levels(x) else sort(unique(as.character(na.omit(x))))
+
+  datos <- base %>%
+    transmute(
+      Sexo = Sexo,
+      Categoria = as.character(.data[[variable]])
+    ) %>%
+    mutate(
+      Categoria = if_else(is.na(Categoria), "No disponible", Categoria),
+      Categoria = factor(Categoria, levels = unique(c(niveles, "No disponible")))
+    )
+
+  total <- datos %>%
+    count(Categoria, .drop = FALSE) %>%
+    filter(n > 0) %>%
+    mutate(Total = fmt_n_pct(n, nrow(datos))) %>%
+    select(Categoria, Total)
+
+  por_sexo <- datos %>%
+    count(Sexo, Categoria, .drop = FALSE) %>%
+    group_by(Sexo) %>%
+    mutate(Valor = fmt_n_pct(n, sum(n))) %>%
+    ungroup() %>%
+    select(Categoria, Sexo, Valor) %>%
+    pivot_wider(names_from = Sexo, values_from = Valor)
+
+  tab <- total %>%
+    left_join(por_sexo, by = "Categoria") %>%
+    filter(Total != "0 (0,0%)")
+
+  if (!"Hombre" %in% names(tab)) tab$Hombre <- "0 (0,0%)"
+  if (!"Mujer" %in% names(tab)) tab$Mujer <- "0 (0,0%)"
+
+  tab %>%
+    mutate(Variable = if_else(row_number() == 1, etiqueta, "")) %>%
+    select(Variable, Categoria, Total, Hombre, Mujer)
+}
+
+tabla_cat_sexo <- bind_rows(
+  resumen_cat_sexo(bd_desc_sexo, "Raza", "Raza/origen"),
+  resumen_cat_sexo(bd_desc_sexo, "Local_cat", "Localización anatómica"),
+  resumen_cat_sexo(bd_desc_sexo, "Estadio", "Estadio"),
+  resumen_cat_sexo(bd_desc_sexo, "Grado", "Grado histológico"),
+  resumen_cat_sexo(bd_desc_sexo, "Evento_muerte_desc", "Estado vital"),
+  resumen_cat_sexo(bd_desc_sexo, "Evento_css_desc", "Evento CSS")
+)
+
+kable(
+  tabla_cat_sexo,
+  caption = "Variables categóricas de la cohorte principal estratificadas por sexo",
+  booktabs = TRUE,
+  longtable = TRUE,
+  align = c("l", "l", "r", "r", "r")
+)
+```
+
+## Histología según sexo
+
+```{r descriptivo-histologia-sexo, message=FALSE, warning=FALSE}
+tabla_histologia_sexo <- resumen_cat_sexo(
+  bd_desc_sexo,
+  "Histologia",
+  "Histología"
+)
+
+kable(
+  tabla_histologia_sexo,
+  caption = "Histología de la cohorte principal estratificada por sexo",
+  booktabs = TRUE,
+  longtable = TRUE,
+  align = c("l", "l", "r", "r", "r")
+)
+```
+
+## Gráficos descriptivos
+
+```{r graficos-descriptivos-sexo-guardar, message=FALSE, warning=FALSE, include=FALSE}
+guardar_figura <- function(figura, archivo, width, height) ggsave(file.path(ruta_salida, archivo), figura, width = width, height = height, dpi = 300)
+
+fig_edad_sexo <- ggplot(bd_desc_sexo, aes(x = Sexo, y = Edad, fill = Sexo)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.9, colour = "grey20") + scale_fill_manual(values = c("Hombre" = "grey35", "Mujer" = "grey75")) +
+  labs(x = "Sexo", y = "Edad al diagnóstico") + theme_bw(base_size = 11) + theme(legend.position = "none")
+guardar_figura(fig_edad_sexo, "fig_edad_por_sexo.png", 6.5, 4.2)
+
+fig_localizacion_sexo <- ggplot(bd_desc_sexo, aes(x = Sexo, fill = Local_cat)) +
+  geom_bar(position = "fill", width = 0.65) + scale_fill_grey(start = 0.15, end = 0.85) + scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Sexo", y = "Porcentaje", fill = "Localización") + theme_bw(base_size = 11) + theme(legend.position = "bottom")
+guardar_figura(fig_localizacion_sexo, "fig_localizacion_por_sexo.png", 7.5, 5)
+
+fig_estadio_sexo <- ggplot(bd_desc_sexo, aes(x = Sexo, fill = Estadio)) +
+  geom_bar(position = "fill", width = 0.65) + scale_fill_grey(start = 0.20, end = 0.80) + scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Sexo", y = "Porcentaje", fill = "Estadio") + theme_bw(base_size = 11) + theme(legend.position = "bottom")
+guardar_figura(fig_estadio_sexo, "fig_estadio_por_sexo.png", 6.5, 4.5)
+
+fig_grado_sexo <- ggplot(bd_desc_sexo, aes(x = Sexo, fill = Grado)) +
+  geom_bar(position = "fill", width = 0.65) + scale_fill_grey(start = 0.15, end = 0.85) + scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Sexo", y = "Porcentaje", fill = "Grado") + theme_bw(base_size = 11) + theme(legend.position = "bottom")
+guardar_figura(fig_grado_sexo, "fig_grado_por_sexo.png", 7.5, 5)
+```
+
+```{r figura-edad-sexo, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='80%', fig.cap='Distribución de la edad al diagnóstico según sexo'}
+knitr::include_graphics(file.path(ruta_salida, "fig_edad_por_sexo.png"))
+```
+
+```{r figura-localizacion-sexo, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='90%', fig.cap='Distribución proporcional de la localización anatómica según sexo'}
+knitr::include_graphics(file.path(ruta_salida, "fig_localizacion_por_sexo.png"))
+```
+
+```{r figura-estadio-sexo, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='85%', fig.cap='Distribución proporcional del estadio tumoral según sexo'}
+knitr::include_graphics(file.path(ruta_salida, "fig_estadio_por_sexo.png"))
+```
+
+```{r figura-grado-sexo, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='90%', fig.cap='Distribución proporcional del grado histológico según sexo'}
+knitr::include_graphics(file.path(ruta_salida, "fig_grado_por_sexo.png"))
+```
+
+# Analisis de supervivencia no ajustado segun sexo
+
+Se realiza un analisis inicial de supervivencia no ajustado mediante curvas de Kaplan-Meier. Primero se evalua la supervivencia global en la cohorte principal y posteriormente la supervivencia especifica por cancer en la cohorte con causa de muerte conocida.
+
+```{r supervivencia-funciones, message=FALSE, warning=FALSE}
+fmt_p <- function(p) ifelse(is.na(p), NA_character_, ifelse(p < 0.001, "<0,001", gsub("\\.", ",", format(round(p, 3), nsmall = 3))))
+fmt_meses <- function(x) ifelse(is.na(x), "No alcanzada", fmt_num(x, 1))
+
+crear_tabla_mediana <- function(ajuste) {
+  survminer::surv_median(ajuste) %>% as_tibble() %>%
+    mutate(strata = str_replace(strata, "^Sexo=", ""), Mediana_meses = fmt_meses(median), IC95 = paste0(fmt_meses(lower), " - ", fmt_meses(upper))) %>%
+    select(Sexo = strata, Mediana_meses, IC95)
+}
+
+crear_tabla_supervivencia_tiempos <- function(ajuste, tiempos = c(12, 36, 60)) {
+  resumen <- summary(ajuste, times = tiempos)
+  tibble(Tiempo_meses = resumen$time, Sexo = str_replace(resumen$strata, "^Sexo=", ""), N_riesgo = resumen$n.risk, Supervivencia = paste0(fmt_pct(100 * resumen$surv, 1), " (IC95% ", fmt_pct(100 * resumen$lower, 1), " - ", fmt_pct(100 * resumen$upper, 1), ")")) %>% arrange(Tiempo_meses, Sexo)
+}
+
+crear_tabla_logrank <- function(test_logrank, nombre) tibble(Analisis = nombre, Chi_cuadrado = fmt_num(test_logrank$chisq, 3), Grados_libertad = length(test_logrank$n) - 1, p_valor = fmt_p(1 - pchisq(test_logrank$chisq, length(test_logrank$n) - 1)))
+
+crear_datos_km <- function(ajuste) {
+  resumen <- summary(ajuste)
+  datos <- tibble(Tiempo = resumen$time, Supervivencia = resumen$surv, Estrato = resumen$strata) %>% mutate(Sexo = str_replace(Estrato, "^Sexo=", ""))
+  bind_rows(datos %>% distinct(Estrato, Sexo) %>% mutate(Tiempo = 0, Supervivencia = 1), datos) %>% arrange(Sexo, Tiempo)
+}
+
+crear_figura_km <- function(ajuste, test_logrank, etiqueta_y, archivo_salida) {
+  datos_km <- crear_datos_km(ajuste); p_logrank <- 1 - pchisq(test_logrank$chisq, length(test_logrank$n) - 1); tiempo_max <- max(datos_km$Tiempo, na.rm = TRUE)
+  figura <- ggplot(datos_km, aes(x = Tiempo, y = Supervivencia, colour = Sexo, group = Sexo)) +
+    geom_step(linewidth = 0.8) + annotate("text", x = tiempo_max * 0.05, y = 0.12, label = paste0("Log-rank p = ", fmt_p(p_logrank)), hjust = 0, size = 3.5) +
+    scale_colour_manual(values = c("Hombre" = "grey20", "Mujer" = "grey65")) + scale_x_continuous(breaks = seq(0, tiempo_max, by = 24)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) + labs(x = "Tiempo desde el diagnostico (meses)", y = etiqueta_y, colour = "Sexo") +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom", panel.grid.minor = element_blank())
+  ggsave(file.path(ruta_salida, archivo_salida), figura, width = 7.5, height = 5, dpi = 300); figura
+}
+```
+
+## Supervivencia global
+
+```{r supervivencia-global-km, message=FALSE, warning=FALSE}
+km_os <- survfit(Surv(Meses_surv, Evento_muerte) ~ Sexo, data = bd_principal)
+logrank_os <- survdiff(Surv(Meses_surv, Evento_muerte) ~ Sexo, data = bd_principal)
+tabla_mediana_os <- crear_tabla_mediana(km_os)
+tabla_supervivencia_os <- crear_tabla_supervivencia_tiempos(km_os)
+tabla_logrank_os <- crear_tabla_logrank(logrank_os, "Supervivencia global")
+
+kable(tabla_mediana_os, caption = "Mediana de supervivencia global segun sexo", booktabs = TRUE, align = c("l", "r", "r"))
+kable(tabla_supervivencia_os, caption = "Supervivencia global estimada a 1, 3 y 5 anos segun sexo", booktabs = TRUE, align = c("r", "l", "r", "r"))
+kable(tabla_logrank_os, caption = "Prueba de log-rank para supervivencia global segun sexo", booktabs = TRUE, align = c("l", "r", "r", "r"))
+```
+
+```{r supervivencia-global-figura-guardar, message=FALSE, warning=FALSE, include=FALSE}
+fig_km_os <- crear_figura_km(
+  km_os,
+  logrank_os,
+  "Supervivencia global",
+  "fig_km_supervivencia_global_sexo.png"
+)
+```
+
+```{r supervivencia-global-figura, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='95%', fig.cap='Curvas de Kaplan-Meier de supervivencia global segun sexo'}
+knitr::include_graphics(file.path(ruta_salida, "fig_km_supervivencia_global_sexo.png"))
+```
+
+## Supervivencia especifica por cancer
+
+```{r supervivencia-css-km, message=FALSE, warning=FALSE}
+km_css <- survfit(Surv(Meses_surv, Evento_css) ~ Sexo, data = bd_css)
+logrank_css <- survdiff(Surv(Meses_surv, Evento_css) ~ Sexo, data = bd_css)
+tabla_mediana_css <- crear_tabla_mediana(km_css)
+tabla_supervivencia_css <- crear_tabla_supervivencia_tiempos(km_css)
+tabla_logrank_css <- crear_tabla_logrank(logrank_css, "Supervivencia especifica por cancer")
+
+kable(tabla_mediana_css, caption = "Mediana de supervivencia especifica por cancer segun sexo", booktabs = TRUE, align = c("l", "r", "r"))
+kable(tabla_supervivencia_css, caption = "Supervivencia especifica por cancer estimada a 1, 3 y 5 anos segun sexo", booktabs = TRUE, align = c("r", "l", "r", "r"))
+kable(tabla_logrank_css, caption = "Prueba de log-rank para supervivencia especifica por cancer segun sexo", booktabs = TRUE, align = c("l", "r", "r", "r"))
+```
+
+```{r supervivencia-css-figura-guardar, message=FALSE, warning=FALSE, include=FALSE}
+fig_km_css <- crear_figura_km(
+  km_css,
+  logrank_css,
+  "Supervivencia especifica por cancer",
+  "fig_km_supervivencia_css_sexo.png"
+)
+```
+
+```{r supervivencia-css-figura, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='95%', fig.cap='Curvas de Kaplan-Meier de supervivencia especifica por cancer segun sexo'}
+knitr::include_graphics(file.path(ruta_salida, "fig_km_supervivencia_css_sexo.png"))
+```
+
+## Modelos de Cox multivariantes
+
+Tras el analisis no ajustado mediante Kaplan-Meier, se ajustan modelos de regresion de Cox para evaluar la asociacion entre sexo y supervivencia despues de ajustar por variables demograficas, clinicas y anatomopatologicas.
+
+```{r cox-funciones, message=FALSE, warning=FALSE}
+preparar_base_cox <- function(base, variables_modelo, variable_evento) {
+  base %>%
+    select(all_of(c("Meses_surv", variable_evento, variables_modelo))) %>%
+    filter(complete.cases(.)) %>%
+    mutate(across(where(is.factor), droplevels))
+}
+
+crear_histologia_cat <- function(histologia) {
+  case_when(
+    str_detect(as.character(histologia), "8140-8389") ~ "Adenocarcinoma",
+    str_detect(as.character(histologia), "8440-8499") ~ "Mucinoso/seroso",
+    str_detect(as.character(histologia), "8000-8009|8010-8049") ~ "Epitelial/NOS",
+    TRUE ~ "Otros"
+  ) %>%
+    factor(
+      levels = c(
+        "Adenocarcinoma",
+        "Mucinoso/seroso",
+        "Epitelial/NOS",
+        "Otros"
+      )
+    )
+}
+
+crear_tabla_muestra_cox <- function(base, variable_evento, nombre_modelo) {
+  tibble(
+    Modelo = nombre_modelo,
+    N = fmt_n(nrow(base)),
+    Eventos = fmt_n(sum(base[[variable_evento]] == 1, na.rm = TRUE)),
+    Censurados = fmt_n(sum(base[[variable_evento]] == 0, na.rm = TRUE))
+  )
+}
+
+crear_tabla_cox <- function(modelo) {
+  resumen <- summary(modelo)
+  coefs <- as.data.frame(resumen$coefficients)
+  ics <- as.data.frame(resumen$conf.int)
+
+  tibble(
+    Termino = rownames(coefs),
+    HR = fmt_num(ics[, "exp(coef)"], 3),
+    IC95 = paste0(
+      fmt_num(ics[, "lower .95"], 3),
+      " - ",
+      fmt_num(ics[, "upper .95"], 3)
+    ),
+    p_valor = sapply(coefs[, "Pr(>|z|)"], fmt_p)
+  )
+}
+
+crear_tabla_termino_cox <- function(modelo, nombre_modelo, termino = "SexoMujer") {
+  resumen <- summary(modelo)
+  coefs <- as.data.frame(resumen$coefficients)
+  ics <- as.data.frame(resumen$conf.int)
+
+  tibble(
+    Modelo = nombre_modelo,
+    Termino = termino,
+    HR = fmt_num(ics[termino, "exp(coef)"], 3),
+    IC95 = paste0(
+      fmt_num(ics[termino, "lower .95"], 3),
+      " - ",
+      fmt_num(ics[termino, "upper .95"], 3)
+    ),
+    p_valor = fmt_p(coefs[termino, "Pr(>|z|)"])
+  )
+}
+
+crear_tabla_ph <- function(test_ph, nombre_modelo) {
+  as.data.frame(test_ph$table) %>%
+    rownames_to_column("Variable") %>%
+    as_tibble() %>%
+    mutate(
+      Modelo = nombre_modelo,
+      Chi_cuadrado = fmt_num(chisq, 3),
+      p_valor = sapply(p, fmt_p)
+    ) %>%
+    select(Modelo, Variable, Chi_cuadrado, df, p_valor)
+}
+```
+
+## Modelos principales sin grado histologico
+
+```{r cox-modelos-principales, message=FALSE, warning=FALSE}
+variables_cox_principal <- c("Sexo", "Edad", "Any_diag", "Raza", "Local_cat", "Estadio", "Histologia_cat")
+bd_principal_cox <- bd_principal %>% mutate(Histologia_cat = crear_histologia_cat(Histologia))
+bd_css_cox <- bd_css %>% mutate(Histologia_cat = crear_histologia_cat(Histologia))
+bd_cox_os <- preparar_base_cox(bd_principal_cox, variables_cox_principal, "Evento_muerte")
+bd_cox_css <- preparar_base_cox(bd_css_cox, variables_cox_principal, "Evento_css")
+
+cox_os <- coxph(Surv(Meses_surv, Evento_muerte) ~ Sexo + Edad + Any_diag + Raza + Local_cat + Estadio + Histologia_cat, data = bd_cox_os, ties = "efron", x = TRUE)
+cox_css <- coxph(Surv(Meses_surv, Evento_css) ~ Sexo + Edad + Any_diag + Raza + Local_cat + Estadio + Histologia_cat, data = bd_cox_css, ties = "efron", x = TRUE)
+
+tabla_histologia_cat_cox <- bd_cox_os %>% count(Histologia_cat) %>% mutate(Porcentaje = fmt_pct(100 * n / sum(n), 1), n = fmt_n(n))
+tabla_muestra_cox_principal <- bind_rows(crear_tabla_muestra_cox(bd_cox_os, "Evento_muerte", "Cox OS principal"), crear_tabla_muestra_cox(bd_cox_css, "Evento_css", "Cox CSS principal"))
+tabla_cox_os <- crear_tabla_cox(cox_os)
+tabla_cox_css <- crear_tabla_cox(cox_css)
+
+kable(tabla_histologia_cat_cox, caption = "Agrupacion simplificada de histologia utilizada en los modelos de Cox", booktabs = TRUE, align = c("l", "r", "r"))
+kable(tabla_muestra_cox_principal, caption = "Muestra incluida en los modelos principales de Cox", booktabs = TRUE, align = c("l", "r", "r", "r"))
+kable(tabla_cox_os, caption = "Modelo de Cox multivariante para supervivencia global", booktabs = TRUE, longtable = TRUE, align = c("l", "r", "r", "r"))
+kable(tabla_cox_css, caption = "Modelo de Cox multivariante para supervivencia especifica por cancer", booktabs = TRUE, longtable = TRUE, align = c("l", "r", "r", "r"))
+```
+
+## Modelos complementarios con grado histologico valido
+
+```{r cox-modelos-grado, message=FALSE, warning=FALSE}
+variables_cox_grado <- c("Sexo", "Edad", "Any_diag", "Raza", "Local_cat", "Estadio", "Grado", "Histologia_cat")
+bd_grado_cox <- bd_grado %>% mutate(Histologia_cat = crear_histologia_cat(Histologia))
+bd_css_grado_cox <- bd_css_grado %>% mutate(Histologia_cat = crear_histologia_cat(Histologia))
+bd_cox_os_grado <- preparar_base_cox(bd_grado_cox, variables_cox_grado, "Evento_muerte")
+bd_cox_css_grado <- preparar_base_cox(bd_css_grado_cox, variables_cox_grado, "Evento_css")
+
+cox_os_grado <- coxph(Surv(Meses_surv, Evento_muerte) ~ Sexo + Edad + Any_diag + Raza + Local_cat + Estadio + Grado + Histologia_cat, data = bd_cox_os_grado, ties = "efron", x = TRUE)
+cox_css_grado <- coxph(Surv(Meses_surv, Evento_css) ~ Sexo + Edad + Any_diag + Raza + Local_cat + Estadio + Grado + Histologia_cat, data = bd_cox_css_grado, ties = "efron", x = TRUE)
+
+tabla_muestra_cox_grado <- bind_rows(crear_tabla_muestra_cox(bd_cox_os_grado, "Evento_muerte", "Cox OS con grado I-IV"), crear_tabla_muestra_cox(bd_cox_css_grado, "Evento_css", "Cox CSS con grado I-IV"))
+tabla_cox_os_grado <- crear_tabla_cox(cox_os_grado)
+tabla_cox_css_grado <- crear_tabla_cox(cox_css_grado)
+
+kable(tabla_muestra_cox_grado, caption = "Muestra incluida en los modelos de Cox con grado histologico valido", booktabs = TRUE, align = c("l", "r", "r", "r"))
+kable(tabla_cox_os_grado, caption = "Modelo de Cox para supervivencia global ajustado por grado histologico", booktabs = TRUE, longtable = TRUE, align = c("l", "r", "r", "r"))
+kable(tabla_cox_css_grado, caption = "Modelo de Cox para supervivencia especifica por cancer ajustado por grado histologico", booktabs = TRUE, longtable = TRUE, align = c("l", "r", "r", "r"))
+```
+
+## Resumen del efecto del sexo y sensibilidad por estadio
+
+```{r cox-resumen-sexo-sensibilidad, message=FALSE, warning=FALSE}
+cox_os_strata_estadio <- coxph(Surv(Meses_surv, Evento_muerte) ~ Sexo + Edad + Any_diag + Raza + Local_cat + Histologia_cat + strata(Estadio), data = bd_cox_os, ties = "efron", x = TRUE)
+cox_css_strata_estadio <- coxph(Surv(Meses_surv, Evento_css) ~ Sexo + Edad + Any_diag + Raza + Local_cat + Histologia_cat + strata(Estadio), data = bd_cox_css, ties = "efron", x = TRUE)
+
+tabla_resumen_sexo_cox <- bind_rows(
+  crear_tabla_termino_cox(cox_os, "OS principal"), crear_tabla_termino_cox(cox_css, "CSS principal"),
+  crear_tabla_termino_cox(cox_os_grado, "OS con grado I-IV"), crear_tabla_termino_cox(cox_css_grado, "CSS con grado I-IV"),
+  crear_tabla_termino_cox(cox_os_strata_estadio, "OS estratificado por estadio"), crear_tabla_termino_cox(cox_css_strata_estadio, "CSS estratificado por estadio")
+)
+
+kable(tabla_resumen_sexo_cox, caption = "Resumen del efecto ajustado del sexo en los modelos de Cox", booktabs = TRUE, align = c("l", "l", "r", "r", "r"))
+```
+
+## Comprobacion del supuesto de riesgos proporcionales
+
+```{r cox-supuesto-ph, message=FALSE, warning=FALSE}
+calcular_ph_seguro <- function(modelo, nombre_modelo) {
+  tryCatch(
+    { test_ph <- cox.zph(modelo, terms = TRUE); crear_tabla_ph(test_ph, nombre_modelo) %>% mutate(Nota = "") },
+    error = function(e) tibble(Modelo = nombre_modelo, Variable = "No estimable", Chi_cuadrado = NA_character_, df = NA_real_, p_valor = NA_character_, Nota = conditionMessage(e))
+  )
+}
+
+tabla_ph <- bind_rows(
+  calcular_ph_seguro(cox_os, "Cox OS principal"), calcular_ph_seguro(cox_css, "Cox CSS principal"),
+  calcular_ph_seguro(cox_os_grado, "Cox OS con grado I-IV"), calcular_ph_seguro(cox_css_grado, "Cox CSS con grado I-IV"),
+  calcular_ph_seguro(cox_os_strata_estadio, "Cox OS estratificado por estadio"), calcular_ph_seguro(cox_css_strata_estadio, "Cox CSS estratificado por estadio")
+)
+
+kable(tabla_ph, caption = "Comprobacion del supuesto de riesgos proporcionales en los modelos de Cox", booktabs = TRUE, longtable = TRUE, align = c("l", "l", "r", "r", "r", "l"))
+```
+
+# Modelo predictivo exploratorio mediante Random Survival Forest
+
+De forma complementaria a los modelos de Cox, se plantea un modelo predictivo exploratorio mediante Random Survival Forest para la supervivencia global. Este analisis no pretende sustituir al modelo multivariante principal ni construir una herramienta clinica validada, sino explorar la capacidad predictiva conjunta de las variables clinico-patologicas y valorar la contribucion relativa del sexo dentro de un modelo multivariable. Para evitar un tiempo de computacion excesivo durante la compilacion, el modelo se ajusta sobre una submuestra aleatoria reproducible cuando la cohorte supera los 50.000 pacientes.
+
+```{r rsf-supervivencia-global, message=FALSE, warning=FALSE, cache=TRUE, results='asis'}
+if (!requireNamespace("ranger", quietly = TRUE)) {
+
+  tabla_rsf_no_disponible <- tibble(
+    Apartado = "Random Survival Forest",
+    Estado = "No ejecutado",
+    Motivo = "El paquete ranger no esta instalado. Ejecutar install.packages('ranger') antes de compilar este apartado."
+  )
+
+  cat(kable(
+    tabla_rsf_no_disponible,
+    caption = "Modelo predictivo exploratorio mediante Random Survival Forest",
+    booktabs = TRUE,
+    align = c("l", "l", "l")
+  ), sep = "\n")
+
+} else {
+
+  set.seed(12345)
+
+  variables_rsf_con_sexo <- c(
+    "Sexo",
+    "Edad",
+    "Any_diag",
+    "Raza",
+    "Local_cat",
+    "Estadio",
+    "Histologia_cat"
+  )
+
+  variables_rsf_sin_sexo <- c(
+    "Edad",
+    "Any_diag",
+    "Raza",
+    "Local_cat",
+    "Estadio",
+    "Histologia_cat"
+  )
+
+  bd_rsf_os <- bd_cox_os %>%
+    select(Meses_surv, Evento_muerte, all_of(variables_rsf_con_sexo)) %>%
+    filter(complete.cases(.)) %>%
+    mutate(across(where(is.factor), droplevels))
+
+  n_rsf_total <- nrow(bd_rsf_os)
+  n_rsf_max <- 50000
+
+  if (n_rsf_total > n_rsf_max) {
+    bd_rsf_os <- bd_rsf_os %>%
+      slice_sample(n = n_rsf_max)
+  }
+
+  n_hilos_rsf <- max(1, parallel::detectCores() - 1)
+
+  rsf_os_con_sexo <- ranger::ranger(
+    Surv(Meses_surv, Evento_muerte) ~ Sexo + Edad + Any_diag +
+    Raza + Local_cat + Estadio + Histologia_cat,
+    data = bd_rsf_os,
+    num.trees = 100,
+    mtry = 3,
+    min.node.size = 200,
+    splitrule = "logrank",
+    importance = "impurity",
+    seed = 12345,
+    num.threads = n_hilos_rsf
+  )
+
+  rsf_os_sin_sexo <- ranger::ranger(
+    Surv(Meses_surv, Evento_muerte) ~ Edad + Any_diag +
+      Raza + Local_cat + Estadio + Histologia_cat,
+    data = bd_rsf_os,
+    num.trees = 100,
+    mtry = 3,
+    min.node.size = 200,
+    splitrule = "logrank",
+    importance = "impurity",
+    seed = 12345,
+    num.threads = n_hilos_rsf
+  )
+
+  tabla_rsf_rendimiento <- tibble(
+    Desenlace = "Supervivencia global",
+    Modelo = c(
+      "RSF clinico con sexo",
+      "RSF clinico sin sexo"
+    ),
+    Variables = c(
+      "Sexo + edad + anio + raza + localizacion + estadio + histologia agrupada",
+      "Edad + anio + raza + localizacion + estadio + histologia agrupada"
+    ),
+    N = fmt_n(nrow(bd_rsf_os)),
+    Eventos = fmt_n(sum(bd_rsf_os$Evento_muerte == 1, na.rm = TRUE)),
+    Muestra = ifelse(
+      n_rsf_total > n_rsf_max,
+      paste0("Submuestra aleatoria de ", fmt_n(n_rsf_max),
+             " pacientes de ", fmt_n(n_rsf_total)),
+      "Cohorte completa"
+    ),
+    C_index_OOB = fmt_num(c(
+      1 - rsf_os_con_sexo$prediction.error,
+      1 - rsf_os_sin_sexo$prediction.error
+    ), 3)
+  )
+
+  etiquetar_variable_rsf <- function(variable) {
+    recode(
+      variable,
+      "Sexo" = "Sexo",
+      "Edad" = "Edad al diagnostico",
+      "Any_diag" = "Anio de diagnostico",
+      "Raza" = "Raza/origen",
+      "Local_cat" = "Localizacion anatomica",
+      "Estadio" = "Estadio tumoral",
+      "Histologia_cat" = "Histologia agrupada",
+      .default = variable
+    )
+  }
+
+  importancia_rsf <- tibble(
+    Variable_original = names(rsf_os_con_sexo$variable.importance),
+    Importancia = as.numeric(rsf_os_con_sexo$variable.importance)
+  ) %>%
+    arrange(desc(Importancia)) %>%
+    mutate(
+      Orden = row_number(),
+      Variable = etiquetar_variable_rsf(Variable_original),
+      Importancia = fmt_num(Importancia, 4)
+    ) %>%
+    select(Orden, Variable, Importancia)
+
+  cat(kable(
+    tabla_rsf_rendimiento,
+    caption = "Rendimiento predictivo interno del Random Survival Forest para supervivencia global",
+    booktabs = TRUE,
+    longtable = TRUE,
+    align = c("l", "l", "l", "r", "r", "l", "r")
+  ), sep = "\n")
+
+  cat("\n\n")
+
+  cat(kable(
+    importancia_rsf,
+    caption = "Resumen ordenado de importancia de variables en el Random Survival Forest con sexo",
+    booktabs = TRUE,
+    align = c("r", "l", "r")
+  ), sep = "\n")
+
+  importancia_rsf_plot <- tibble(
+    Variable_original = names(rsf_os_con_sexo$variable.importance),
+    Importancia = as.numeric(rsf_os_con_sexo$variable.importance)
+  ) %>%
+    arrange(Importancia) %>%
+    mutate(
+      Variable = etiquetar_variable_rsf(Variable_original),
+      Variable = factor(Variable, levels = Variable)
+    )
+
+  fig_importancia_rsf <- ggplot(importancia_rsf_plot, aes(x = Variable, y = Importancia)) +
+    geom_col(fill = "grey45", width = 0.65) +
+    coord_flip() +
+    labs(
+      x = "Variable",
+      y = "Importancia de variables"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.minor = element_blank())
+
+  ggsave(
+    file.path(ruta_salida, "fig_importancia_rsf_os.png"),
+    fig_importancia_rsf,
+    width = 7,
+    height = 4.5,
+    dpi = 300
+  )
+}
+```
+
+```{r figura-importancia-rsf, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', out.width='85%', fig.cap='Importancia de variables en el Random Survival Forest para supervivencia global'}
+if (requireNamespace("ranger", quietly = TRUE) &&
+    file.exists(file.path(ruta_salida, "fig_importancia_rsf_os.png"))) {
+  knitr::include_graphics(file.path(ruta_salida, "fig_importancia_rsf_os.png"))
+}
+```
