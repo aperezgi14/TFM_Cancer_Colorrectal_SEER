@@ -17,7 +17,7 @@ Por motivos de privacidad y debido a las estrictas restricciones del acuerdo de 
 Para poder reproducir o auditar este análisis en su equipo local, por favor siga estos pasos:
 
 1. **Solicitar acceso** y descargar la cohorte correspondiente de pacientes con cáncer colorrectal (periodo de diagnóstico 2004-2022) directamente desde el portal oficial de SEER.
-2. **Descargar los datos de SEER** Seguir los pasos del punto 3.4 para obtener los mismos datos de SEER. 
+2. **Descargar los datos de SEER** y seguir los pasos del punto 3.4 para obtener los mismos datos de SEER. 
 3. **Descargar el archivo** `Código_TFM_APG.Rmd` de este repositorio y guardarlo en la carpeta de su elección.
 4. **Modificar la ruta de datos (IMPORTANTE):** El script original utiliza una ruta local absoluta para cargar la base de datos. Antes de ejecutar el código en RStudio, localice el bloque de carga de datos en las primeras líneas del archivo `.Rmd` y modifique la ruta por la de su directorio local:
 
