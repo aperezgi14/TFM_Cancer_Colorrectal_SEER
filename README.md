@@ -30,4 +30,4 @@ Para poder reproducir o auditar este análisis en su equipo local, por favor sig
      bd_TFM <- read_tsv("SU_RUTA_LOCAL/BD_APG.txt", ...)
      ```
 
-5. **Ejecutar el script** de forma secuencial en RStudio. Asegúrese de tener instaladas todas las librerías biomédicas y estadísticas requeridas en el código (como `survival`, `randomForestSRC`, `tableone`, entre otras).
+5. **Ejecutar el script** de forma secuencial en RStudio. Asegúrese de tener instaladas todas las librerías biomédicas y estadísticas requeridas en el código.
